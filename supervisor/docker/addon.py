@@ -624,8 +624,9 @@ class DockerAddon(DockerInterface):
             _LOGGER.warning("Can't update DNS for %s", self.name)
             await async_capture_exception(err)
 
-        # Hardware Access
-        if self.addon.static_devices:
+        # Hardware Access — register listener for both manifest static_devices and
+        # options-based devices (e.g. Z-Wave JS `device:` option).
+        if self.addon.static_devices or self.addon.devices:
             self._hw_listener = self.sys_bus.register_event(
                 BusEvent.HARDWARE_NEW_DEVICE, self._hardware_events
             )
@@ -889,10 +890,16 @@ class DockerAddon(DockerInterface):
     )
     async def _hardware_events(self, device: Device) -> None:
         """Process Hardware events for adjust device access."""
-        if not any(
-            device_path in (device.path, device.sysfs)
-            for device_path in self.addon.static_devices
-        ):
+        # Build the full set of paths this device is known by (path, sysfs, and all
+        # by-id / by-path symlinks), so we match even when static_devices stores a
+        # by-id path rather than the raw /dev/ttyACMx path.
+        device_all_paths = {device.path, device.sysfs} | set(device.links)
+        static_match = bool(device_all_paths & set(self.addon.static_devices))
+        # Also check options-based devices (e.g. Z-Wave JS `device:` option).
+        # addon.devices re-evaluates from options.json against the current hardware
+        # list, so it will resolve to the newly enumerated device (e.g. ttyACM1).
+        options_match = device in self.addon.devices
+        if not static_match and not options_match:
             return
 
         try:
