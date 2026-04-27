@@ -625,6 +625,15 @@ class DockerApp(DockerInterface):
                 BusEvent.HARDWARE_NEW_DEVICE, self._hardware_events
             )
 
+            # Proactively ensure cgroup permissions match the current device paths.
+            # The container is created with device_cgroup_rules from cgroups_rules,
+            # but if the device re-enumerated to a different minor since the last
+            # container creation (e.g. ttyACM0 → ttyACM1 after reboot), the rules
+            # baked into the container config may be stale. Adding the current rules
+            # via the cgroup API ensures access even without a new hardware event.
+            if self.sys_os.available:
+                await self._update_device_cgroup_permissions()
+
     @Job(
         name="docker_addon_update",
         on_condition=DockerJobError,
@@ -879,6 +888,53 @@ class DockerApp(DockerInterface):
             )
         ):
             self.sys_resolution.dismiss_issue(issue)
+
+    async def _update_device_cgroup_permissions(self) -> None:
+        """Proactively add cgroup device permissions for all current devices.
+
+        This ensures the running container has access to devices even if they
+        re-enumerated to a different minor number since the container was created.
+        """
+        try:
+            docker_container = await self.sys_docker.containers.get(self.name)
+        except aiodocker.DockerError:
+            return
+
+        for device_path in self.app.static_devices:
+            try:
+                device = self.sys_hardware.get_by_path(device_path)
+            except HardwareNotFound:
+                continue
+            if not self.sys_hardware.policy.allowed_for_access(device):
+                continue
+            permission = self.sys_hardware.policy.get_cgroups_rule(device)
+            try:
+                await self.sys_dbus.agent.cgroup.add_devices_allowed(
+                    docker_container.id, permission
+                )
+            except DBusError:
+                _LOGGER.warning(
+                    "Failed to add cgroup permission '%s' for %s", permission, self.name
+                )
+
+        for device in self.app.devices:
+            if not self.sys_hardware.policy.allowed_for_access(device):
+                continue
+            permission = self.sys_hardware.policy.get_cgroups_rule(device)
+            try:
+                await self.sys_dbus.agent.cgroup.add_devices_allowed(
+                    docker_container.id, permission
+                )
+                _LOGGER.debug(
+                    "Ensured cgroup permission '%s' for device %s on %s",
+                    permission,
+                    device.path,
+                    self.name,
+                )
+            except DBusError:
+                _LOGGER.warning(
+                    "Failed to add cgroup permission '%s' for %s", permission, self.name
+                )
 
     @Job(
         name="docker_addon_hardware_events",

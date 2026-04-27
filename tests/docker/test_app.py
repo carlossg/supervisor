@@ -25,8 +25,14 @@ from supervisor.docker.const import (
     PropagationMode,
 )
 from supervisor.docker.manager import DockerAPI
-from supervisor.exceptions import CoreDNSError, DockerNotFound
+from supervisor.exceptions import (
+    CoreDNSError,
+    DBusError,
+    DockerNotFound,
+    HardwareNotFound,
+)
 from supervisor.hardware.data import Device
+from supervisor.hardware.manager import HardwareManager
 from supervisor.os.manager import OSManager
 from supervisor.plugins.dns import PluginDns
 from supervisor.resolution.const import ContextType, IssueType, SuggestionType
@@ -642,3 +648,134 @@ async def test_app_options_device_hw_listener(
         await fire_bus_event(coresys, BusEvent.HARDWARE_NEW_DEVICE, TEST_HW_DEVICE)
 
         add_devices.assert_called_once_with(123, "c 0:0 rwm")
+
+
+# --- Tests for fix: proactively apply cgroup permissions on addon start ---
+
+
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
+async def test_app_proactive_cgroup_permissions_options_device(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container: MagicMock,
+):
+    """Test proactive cgroup permissions applied on start for options-based devices.
+
+    If the device re-enumerated to a different minor since the container was
+    created, no hardware event fires. _update_device_cgroup_permissions is
+    called right after start to cover this window.
+    """
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    install_app_ssh.data["devices"] = []  # no static devices
+    container.id = 123
+
+    with (
+        patch.object(App, "write_options"),
+        patch.object(OSManager, "available", new=PropertyMock(return_value=True)),
+        patch.object(
+            App, "devices", new_callable=PropertyMock, return_value={TEST_HW_DEVICE}
+        ),
+        patch.object(
+            CGroup, "add_devices_allowed", new_callable=AsyncMock
+        ) as add_devices,
+    ):
+        await install_app_ssh.start()
+        # No hardware event — permissions must come from the proactive call alone.
+        add_devices.assert_called_once_with(123, "c 0:0 rwm")
+
+
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
+async def test_app_proactive_cgroup_permissions_static_device(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container: MagicMock,
+):
+    """Test proactive cgroup permissions applied on start for static devices."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    install_app_ssh.data["devices"] = [TEST_DEV_PATH]
+    container.id = 123
+
+    with (
+        patch.object(App, "write_options"),
+        patch.object(OSManager, "available", new=PropertyMock(return_value=True)),
+        patch.object(HardwareManager, "get_by_path", return_value=TEST_HW_DEVICE),
+        patch.object(
+            CGroup, "add_devices_allowed", new_callable=AsyncMock
+        ) as add_devices,
+    ):
+        await install_app_ssh.start()
+        # No hardware event — permissions come from the proactive call.
+        add_devices.assert_called_once_with(123, "c 0:0 rwm")
+
+
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
+async def test_app_proactive_cgroup_permissions_skipped_without_haos(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container: MagicMock,
+):
+    """Test proactive cgroup call is skipped when HAOS is not available."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    install_app_ssh.data["devices"] = []
+    container.id = 123
+
+    with (
+        patch.object(App, "write_options"),
+        patch.object(OSManager, "available", new=PropertyMock(return_value=False)),
+        patch.object(
+            App, "devices", new_callable=PropertyMock, return_value={TEST_HW_DEVICE}
+        ),
+        patch.object(
+            CGroup, "add_devices_allowed", new_callable=AsyncMock
+        ) as add_devices,
+    ):
+        await install_app_ssh.start()
+        add_devices.assert_not_called()
+
+
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
+async def test_app_proactive_cgroup_permissions_hardware_not_found(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container: MagicMock,
+):
+    """Test proactive cgroup skips static devices not present in hardware list."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    install_app_ssh.data["devices"] = [TEST_DEV_PATH]
+    container.id = 123
+
+    with (
+        patch.object(App, "write_options"),
+        patch.object(OSManager, "available", new=PropertyMock(return_value=True)),
+        patch.object(HardwareManager, "get_by_path", side_effect=HardwareNotFound),
+        patch.object(
+            CGroup, "add_devices_allowed", new_callable=AsyncMock
+        ) as add_devices,
+    ):
+        await install_app_ssh.start()
+        add_devices.assert_not_called()
+
+
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
+async def test_app_proactive_cgroup_permissions_dbus_error(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container: MagicMock,
+):
+    """Test proactive cgroup logs warning and continues on DBusError."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    install_app_ssh.data["devices"] = []
+    container.id = 123
+
+    with (
+        patch.object(App, "write_options"),
+        patch.object(OSManager, "available", new=PropertyMock(return_value=True)),
+        patch.object(
+            App, "devices", new_callable=PropertyMock, return_value={TEST_HW_DEVICE}
+        ),
+        patch.object(
+            CGroup, "add_devices_allowed", new_callable=AsyncMock, side_effect=DBusError
+        ),
+    ):
+        # Should not raise — DBusError is caught and logged as a warning.
+        await install_app_ssh.start()
