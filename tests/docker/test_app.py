@@ -572,3 +572,73 @@ async def test_ulimits_integration(coresys: CoreSys, install_app_ssh: App):
     assert core_limit is not None
     assert core_limit.soft == 0
     assert core_limit.hard == 0
+
+
+# --- Tests for fix: register hw listener and match by-id paths for options-based devices ---
+
+TEST_BY_ID_PATH = str(TEST_HW_DEVICE.links[0])
+
+
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
+async def test_app_new_device_by_id_link(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container: MagicMock,
+    docker: DockerAPI,
+):
+    """Test hardware event matches a by-id symlink stored in static_devices."""
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    # Configure the device via its by-id symlink, not the raw /dev/ttyACMx path.
+    # Before the fix, _hardware_events only checked device.path / device.sysfs and
+    # would never match a by-id path, so add_devices_allowed was never called.
+    install_app_ssh.data["devices"] = [TEST_BY_ID_PATH]
+    container.id = 123
+
+    with (
+        patch.object(App, "write_options"),
+        patch.object(OSManager, "available", new=PropertyMock(return_value=True)),
+        patch.object(
+            CGroup, "add_devices_allowed", new_callable=AsyncMock
+        ) as add_devices,
+    ):
+        await install_app_ssh.start()
+        await fire_bus_event(coresys, BusEvent.HARDWARE_NEW_DEVICE, TEST_HW_DEVICE)
+
+        add_devices.assert_called_once_with(123, "c 0:0 rwm")
+
+
+@pytest.mark.usefixtures("path_extern", "tmp_supervisor_data")
+async def test_app_options_device_hw_listener(
+    coresys: CoreSys,
+    install_app_ssh: App,
+    container: MagicMock,
+    docker: DockerAPI,
+):
+    """Test hw_listener is registered and fires for options-based devices.
+
+    Before the fix, _hw_listener was only registered when addon.static_devices
+    was non-empty. Add-ons like Z-Wave JS that configure the device via the
+    options schema (addon.devices) never had a listener, so cgroup permissions
+    were never updated after a USB re-enumeration.
+    """
+    coresys.hardware.disk.get_disk_free_space = lambda x: 5000
+    install_app_ssh.data["devices"] = []  # no static devices
+    container.id = 123
+    docker._info = replace(docker.info, cgroup="1")  # pylint: disable=protected-access
+
+    with (
+        patch.object(App, "write_options"),
+        # HAOS not available: proactive cgroup call is skipped, so add_devices is
+        # called exactly once — from the hardware event via the options listener.
+        patch.object(OSManager, "available", new=PropertyMock(return_value=False)),
+        patch.object(
+            App, "devices", new_callable=PropertyMock, return_value={TEST_HW_DEVICE}
+        ),
+        patch.object(
+            CGroup, "add_devices_allowed", new_callable=AsyncMock
+        ) as add_devices,
+    ):
+        await install_app_ssh.start()
+        await fire_bus_event(coresys, BusEvent.HARDWARE_NEW_DEVICE, TEST_HW_DEVICE)
+
+        add_devices.assert_called_once_with(123, "c 0:0 rwm")
